@@ -620,11 +620,12 @@ bool ne_init(native_engine& ne, const localvqe_model& m) {
     const auto& fc = hp.far_channels;   // [2,16,20]
     const int kh = hp.kernel_size_h, kw = hp.kernel_size_w;
     // Every conv kernel path here (NEON lane-indexed taps, AVX-512 4-chain
-    // tiles, the bf16 row pairs) is written for kw == 4 and kh <= 8; refuse
-    // anything else so the caller falls back to the graph instead of
-    // computing garbage.
-    if (kw != 4 || kh < 1 || kh > 8) {
-        fprintf(stderr, "native: unsupported kernel %dx%d (need kw==4, kh<=8)\n", kh, kw);
+    // tiles, the bf16 row pairs) is written for kw == 4 and kh <= 8, and the
+    // bf16 path pairs rows (kh / 2 pairs), so kh must be even or the newest
+    // row would silently drop out of the conv. Refuse anything else so the
+    // caller falls back to the graph instead of computing garbage.
+    if (kw != 4 || kh < 2 || kh > 8 || kh % 2 != 0) {
+        fprintf(stderr, "native: unsupported kernel %dx%d (need kw==4, even kh<=8)\n", kh, kw);
         return false;
     }
     int F = ne.F;
@@ -635,7 +636,7 @@ bool ne_init(native_engine& ne, const localvqe_model& m) {
     // concat use mic_e2's width), five encoder halvings down to F/32, and a
     // 27-channel (3 x 9) complex-mask output for the CCM. Anything else must
     // fail here, not index out of range at runtime.
-    if (F != 256 || hp.n_fft != 512 || hp.dmax <= 0 || hp.align_hidden <= 0 ||
+    if (F != 256 || hp.n_fft != 512 || hp.hop_length != 256 || hp.dmax <= 0 || hp.align_hidden <= 0 ||
         mc.size() != 6 || fc.size() != 3 || mc[0] != 2 || fc[0] != 2 ||
         mc[2] != fc[2] || F % 32 != 0) {
         fprintf(stderr, "native: unsupported model geometry\n");

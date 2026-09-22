@@ -149,6 +149,13 @@ static localvqe_ctx_t make_ctx(const char* model_path,
         if (pref.empty()) {
             if (const char* e = std::getenv("LOCALVQE_ENGINE")) pref = e;
         }
+        if (pref == "auto") pref.clear();
+        if (!pref.empty() && pref != "graph" && pref != "native") {
+            // A misspelled kill switch must not silently select either engine.
+            fprintf(stderr, "localvqe: unknown engine '%s' (want auto|graph|native), using auto\n",
+                    pref.c_str());
+            pref.clear();
+        }
         const bool want_native = (pref != "graph");
         const bool cpu_backend = (std::string(backend_name) == "CPU");
         if (want_native && cpu_backend && !ctx->daf.loaded &&
