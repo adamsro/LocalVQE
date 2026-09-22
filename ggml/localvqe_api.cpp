@@ -11,6 +11,7 @@
 #include "daf_frontend.h"
 #include "localvqe_graph.h"
 #include "noise_gate.h"
+#include "native_engine.h"
 
 #include <algorithm>
 #include <cmath>
@@ -32,6 +33,16 @@ struct localvqe_ctx {
     dvqe_graph_model graph_model;
     dvqe_stream_graph stream_graph;
     std::string last_error;
+
+    // Hand-written single-thread streaming engine (native_engine.cpp), a
+    // drop-in for process_frame_graph on the CPU backend. Selected at
+    // construction when the GGUF is one it implements (v1.2-family mask
+    // model: version>=3, kw==4, no DAF); the ggml graph is still built so
+    // the two can be switched per context (options "engine" / env
+    // LOCALVQE_ENGINE=graph|native). The engine keeps its own copy of the
+    // weights; the raw localvqe_model is dropped after init.
+    native_engine ne;
+    bool use_native = false;
 
     // Front-end-only build (2.7K release): mask graph never built; each
     // hop emits the adaptive filter's output `e` directly.
@@ -74,12 +85,25 @@ struct localvqe_options {
     std::string backend_name = "CPU";
     int device_index = 0;
     int n_threads = 0;  // 0 = auto / honour GGML_NTHREADS env var
+    std::string engine;  // "" = auto (env LOCALVQE_ENGINE, else native when supported)
 };
+
+// True when the native engine implements this model exactly (it mirrors the
+// v11/SiLU streaming graph builders; see native_engine.h).
+static inline bool hop_length_ok(const localvqe_hparams& hp) { return hp.hop_length == 256; }
+static bool native_engine_supported(const localvqe_hparams& hp) {
+    return hp.version >= 3 && hp.kernel_size_w == 4 && hp.kernel_size_h >= 2 &&
+           hp.n_fft == 512 && hop_length_ok(hp) && hp.n_freq_bins == 256 &&
+           !hp.daf_standalone && hp.mic_channels.size() == 6 &&
+           hp.far_channels.size() == 3;
+}
+
 
 static localvqe_ctx_t make_ctx(const char* model_path,
                                const char* backend_name,
                                int device_index,
-                               int n_threads_override = 0) {
+                               int n_threads_override = 0,
+                               const char* engine_pref = "") {
     auto* ctx = new (std::nothrow) localvqe_ctx;
     if (!ctx) return 0;
 
@@ -119,6 +143,30 @@ static localvqe_ctx_t make_ctx(const char* model_path,
     } else if (daf_ok) {
         fprintf(stderr, "localvqe: DAF front-end active (203K cascade)\n");
     }
+    // Engine selection: explicit option > LOCALVQE_ENGINE env > auto.
+    {
+        std::string pref = engine_pref ? engine_pref : "";
+        if (pref.empty()) {
+            if (const char* e = std::getenv("LOCALVQE_ENGINE")) pref = e;
+        }
+        const bool want_native = (pref != "graph");
+        const bool cpu_backend = (std::string(backend_name) == "CPU");
+        if (want_native && cpu_backend && !ctx->daf.loaded &&
+            native_engine_supported(ctx->graph_model.hparams)) {
+            localvqe_model raw;
+            if (load_model(model_path, raw, false) && ne_init(ctx->ne, raw)) {
+                ctx->use_native = true;
+            } else {
+                fprintf(stderr, "localvqe: native engine %s, using the ggml graph\n",
+                        pref == "native" ? "requested but init failed" : "init failed");
+            }
+        } else if (pref == "native") {
+            fprintf(stderr, "localvqe: native engine requested but unsupported for this model/backend\n");
+        }
+        if (!ctx->daf_standalone)
+            fprintf(stderr, "localvqe: engine=%s\n", ctx->use_native ? "native" : "graph");
+    }
+
     ctx->daf_e.assign(hop, 0.0f);
     ctx->daf_yhat.assign(hop, 0.0f);
     ctx->pcm_hist_mic.assign(hop, 0.0f);
@@ -178,6 +226,23 @@ LOCALVQE_API int localvqe_options_set_threads(localvqe_options_t handle,
     return 0;
 }
 
+LOCALVQE_API int localvqe_options_set_engine(localvqe_options_t handle,
+                                             const char* engine) {
+    if (!handle) return -1;
+    if (!engine) return -2;
+    std::string e = engine;
+    if (e != "" && e != "auto" && e != "graph" && e != "native") return -2;
+    reinterpret_cast<localvqe_options*>(handle)->engine = (e == "auto") ? "" : e;
+    return 0;
+}
+
+LOCALVQE_API const char* localvqe_engine_name(localvqe_ctx_t handle) {
+    if (!handle) return "";
+    auto* ctx = reinterpret_cast<localvqe_ctx*>(handle);
+    if (ctx->daf_standalone) return "daf";
+    return ctx->use_native ? "native" : "graph";
+}
+
 LOCALVQE_API localvqe_ctx_t localvqe_new_with_options(localvqe_options_t handle) {
     if (!handle) return 0;
     auto* opts = reinterpret_cast<localvqe_options*>(handle);
@@ -188,7 +253,8 @@ LOCALVQE_API localvqe_ctx_t localvqe_new_with_options(localvqe_options_t handle)
     return make_ctx(opts->model_path.c_str(),
                     opts->backend_name.c_str(),
                     opts->device_index,
-                    opts->n_threads);
+                    opts->n_threads,
+                    opts->engine.c_str());
 }
 
 LOCALVQE_API void localvqe_list_devices(void) {
@@ -259,9 +325,14 @@ static void stream_one_frame(localvqe_ctx* ctx, const float* mic,
     build_window(ctx->pcm_hist_mic, mic, hop, ctx->mic_window.data());
     build_window(ctx->pcm_hist_ref, ref, hop, ctx->ref_window.data());
 
-    process_frame_graph(ctx->stream_graph, ctx->graph_model,
-                        ctx->mic_window.data(), ctx->ref_window.data(),
-                        ctx->enh_window.data());
+    if (ctx->use_native) {
+        ne_process_frame(ctx->ne, ctx->mic_window.data(),
+                         ctx->ref_window.data(), ctx->enh_window.data());
+    } else {
+        process_frame_graph(ctx->stream_graph, ctx->graph_model,
+                            ctx->mic_window.data(), ctx->ref_window.data(),
+                            ctx->enh_window.data());
+    }
 
     // OLA scale below: v1's DCT codec has no analysis window so the two
     // overlapping frame contributions must be halved; v1.1's sqrt-Hann²
@@ -300,6 +371,7 @@ LOCALVQE_API int localvqe_process_f32(localvqe_ctx_t handle,
 
     if (!ctx->daf_standalone)
         reset_stream_graph(ctx->stream_graph, ctx->graph_model);
+    if (ctx->use_native) ne_reset(ctx->ne);
     if (ctx->daf.loaded) daf_reset(ctx->daf);
     // Standalone front-end: the whole clip is available here (callers pass the
     // full signal), so prime the bulk delay once and lock it — the filter is
@@ -415,6 +487,7 @@ LOCALVQE_API void localvqe_reset(localvqe_ctx_t handle) {
     auto* ctx = reinterpret_cast<localvqe_ctx*>(handle);
     if (!ctx->daf_standalone)
         reset_stream_graph(ctx->stream_graph, ctx->graph_model);
+    if (ctx->use_native) ne_reset(ctx->ne);
     if (ctx->daf.loaded) daf_reset(ctx->daf);
     std::fill(ctx->pcm_hist_mic.begin(), ctx->pcm_hist_mic.end(), 0.0f);
     std::fill(ctx->pcm_hist_ref.begin(), ctx->pcm_hist_ref.end(), 0.0f);

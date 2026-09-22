@@ -101,7 +101,16 @@ LOCALVQE_API int localvqe_options_set_threads(localvqe_options_t opts,
  * Construct a context from a populated options handle. model_path must
  * have been set. Returns an opaque ctx handle, or 0 on failure.
  */
+/// Inference engine: "auto" (default: the hand-written native engine when it
+/// implements the model, else the ggml graph), "graph", or "native". The env
+/// var LOCALVQE_ENGINE=graph|native applies when the option is unset.
+LOCALVQE_API int localvqe_options_set_engine(localvqe_options_t opts,
+                                             const char* engine);
+
 LOCALVQE_API localvqe_ctx_t localvqe_new_with_options(localvqe_options_t opts);
+
+/// Which engine this context runs: "native", "graph" or "daf" (front-end-only build).
+LOCALVQE_API const char* localvqe_engine_name(localvqe_ctx_t ctx);
 
 /**
  * Print every registered backend + device to stderr. No model required.
